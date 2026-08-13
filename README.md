@@ -1,61 +1,234 @@
-# FlightSim
+# flightSim — 無尾翼機 縦安定シミュレータ / ゲーム
 
-飛行力学に基づいた飛行シミュレーションゲーム。機体パラメータ（翼形状・位置・重心など）をGUIで設計し、リアルタイムで飛行特性を確認・操縦できる。
+縦（ピッチ）の安定性の式を教科書どおりに実装し、**無尾翼機のエレボン（フラップ）だけを操作して
+水平飛行を維持する**ゲームです。ゲーム開始前の設計フェーズで **アスペクト比・テーパー比・後退角**
+などを決めると、そこから **平均空力翼弦 (MAC)・空力中心 (MAC 前縁から 25%)・質量中心** が
+計算され、静安定余裕と固有モードが決まります。
 
-## 要件
+---
 
-- CMake 3.16 以上
-- g++ / clang++ （C++17対応）
-- macOS：Xcode Command Line Tools
-  ```
-  xcode-select --install
-  ```
-- OpenGL（macOS標準搭載）
+## 1. 遊び方
 
-## ビルド手順
+### DESIGN 画面
+
+| キー | 動作 |
+|---|---|
+| `↑` `↓` | 設計変数の選択 |
+| `←` `→` | 値の増減（`SHIFT` 併用で 5 倍ステップ） |
+| `1`〜`5` | 難易度プリセット（バラスト位置が後退していく） |
+| `ENTER` | 飛行開始 |
+| `ESC` | 終了 |
+
+設計変数：アスペクト比 `AR` / テーパー比 `λ` / 前縁後退角 `Λ_LE` / 翼端ねじり下げ `ε` /
+バラスト位置 `x_b` / バラスト質量比 / エレボン弦長比 / エレボン内端 / 翼型 `Cm_ac`。
+
+変更するたびに右側に MAC、`x_ac`、`x_cg`、**静安定余裕 `Kn`**、`Iyy`、各空力微係数、
+水平定常飛行のトリム解、短周期／フゴイドの固有値が即座に再計算されます。
+
+### FLIGHT 画面
+
+| キー | 動作 |
+|---|---|
+| `↑` `↓` | エレボン（`↑` = 後縁上げ = 機首上げ） |
+| `W` `S` | スロットル |
+| `TAB` | 非線形 3DOF ⇄ 小擾乱線形モデル の切替 |
+| `P` | ピッチダンパー（SAS）ON/OFF |
+| `R` | 飛行やり直し |
+| `D` | 設計画面へ戻る |
+| `ESC` | 終了 |
+
+**目標**：高度 500 ± 25 m かつ 速度 目標 ± 10% のバンドに **20 秒間連続** で留まる。
+
+失敗条件：接地 (`h ≤ 0`) / `|θ| > 85°` / 失速状態が 8 秒継続（ディープストール）。
+
+---
+
+## 2. 実装している式
+
+### 2.1 平面形 → MAC・空力中心・質量中心（`src/aircraft/planform.cpp`）
+
+台形翼（原点は翼頂点 = 翼根前縁、`x` は後方正、`η = 2y/b`）:
+
+```
+b      = sqrt(AR · S)
+c_r    = 2S / (b (1 + λ))
+c(η)   = c_r (1 - (1 - λ) η)
+MAC    = (2/S) ∫ c² dy = (2/3) c_r (1 + λ + λ²)/(1 + λ)
+y_MAC  = (b/6) (1 + 2λ)/(1 + λ)
+x_LE(MAC) = y_MAC · tan Λ_LE
+x_ac   = x_LE(MAC) + 0.25 · MAC          ← 空力中心 = MAC の 25%
+```
+
+**重心 = 質量中心**。翼を面密度一定の板として帯状片で積分し、点質量のバラストと合成する:
+
+```
+x_cg,wing = ∫ (x_LE(y) + c/2) c dy / ∫ c dy
+x_cg      = (m_wing x_cg,wing + m_ballast x_b) / m
+Iyy       = ∫ [ (x_strip - x_cg)² + c²/12 ] dm + m_ballast (x_b - x_cg)²
+```
+
+台形翼の面積中心は **厳密に MAC の 50%** になります（コードは数値積分で求め、
+テストでこの厳密解と一致することを確認しています）。つまりバラスト無しの無尾翼機は
+
+```
+Kn = h_n - h = 0.25 - 0.50 = -0.25
+```
+
+で必ず静不安定。**バラストを前に置いて静安定余裕を買う** のが無尾翼機の設計です。
+
+```
+h   = (x_cg - x_LE(MAC)) / MAC
+h_n = 0.25
+Kn  = h_n - h            静安定余裕
+```
+
+### 2.2 空力微係数（同上）
+
+| 量 | 式 | 出典 |
+|---|---|---|
+| `CL_α` | `2πA / (2 + √(A²(1 + tan²Λ_c/2) + 4))` | DATCOM 亜音速有限翼 |
+| `e` | `1.78(1 - 0.045 A^0.68) - 0.64`（`Λ_LE ≤ 30°`） | Raymer |
+| `CL_q` | `(0.5 + 2 Kn) CL_α` | DATCOM 翼単体 |
+| `Cm_q` | `-0.9 CL_α cosΛ_c/4 [ A(0.5x̄+2x̄²)/(A+2cosΛ) + A³tan²Λ/(24(A+6cosΛ)) + 1/8 ]` | DATCOM 翼単体 |
+| `Cm_ac` | `cm_翼型 - (2/(S·MAC)) ∫ a ε(η) c (x_c/4 - x_ac) dy` | 帯状片積分 |
+| `CL_δ`, `Cm_δ,ac` | 薄翼フラップ理論 `θ_f = acos(2c_f/c - 1)` を帯状片積分（経験補正 0.85） | |
+
+`Cm_q` に `tan²Λ` の項があるとおり、**後退角を増やすとピッチ減衰が大きく増えます**。
+`Cm_ac` の式は **後退翼＋翼端ねじり下げ（washout）が正の `Cm_0` を生む** という
+無尾翼機の縦トリム機構をそのまま表しています（後退角 0 では効果がほぼ消えることをテストで確認）。
+
+### 2.3 空力係数（`src/aerodynamics/aerodynamics.cpp`）
+
+```
+q̂ = q·MAC/(2V),   α̂̇ = α̇·MAC/(2V)
+
+CL_lin = CL0 + CL_α α + CL_q q̂ + CL_α̇ α̂̇ + CL_δ δ
+CL     = (1-σ) CL_lin + σ · 2 sin²α cosα              σ = 失速ブレンド関数
+CD     = CD0 + k CL² + k_δ δ² + σ · 1.2 sin²α         k = 1/(π A e)
+Cm     = Cm_ac + Cm_δ,ac δ + (h - h_n) CL + Cm_q q̂ + Cm_α̇ α̂̇
+```
+
+したがって `Cm_α = -(Kn) CL_α`、`Cm_δ = Cm_δ,ac + (h - h_n) CL_δ`。
+
+失速ブレンドは Anderson の指数関数
+`σ = (1 + e^{-M(α-α_s)} + e^{M(α+α_s)}) / ((1 + e^{-M(α-α_s)})(1 + e^{M(α+α_s)}))`。
+
+### 2.4 非線形 3 自由度 縦運動方程式（`src/dynamics/dynamics.cpp`）
+
+機体軸、対称面内（`v = p = r = 0`）:
+
+```
+u̇ = -q w - g sinθ + (X_A + T)/m
+ẇ =  q u + g cosθ + Z_A/m
+q̇ =  M_A / Iyy
+θ̇ =  q
+ḣ =  u sinθ - w cosθ
+ẋ =  u cosθ + w sinθ
+
+V = √(u²+w²),  α = atan2(w,u),  γ = θ - α,  q̄ = ½ρV²
+X_A =  L sinα - D cosα,   Z_A = -L cosα - D sinα
+L = q̄ S CL,  D = q̄ S CD,  M_A = q̄ S·MAC·Cm
+```
+
+積分は古典 4 次 Runge–Kutta（固定ステップ 2 ms）。大気は ISA（0–11 km + 等温層）。
+
+### 2.5 トリム（`src/stability/stability.cpp`）
+
+水平定常飛行（`γ = 0`, `θ = α`）の 2 元連立を Newton 法（数値ヤコビアン）で解く:
+
+```
+Cm(α, δ) = 0
+L cosα + D sinα = W cosα
+T = (W - L) sinα + D cosα
+```
+
+### 2.6 次元付き安定微係数（安定軸, `u0 = V_trim`, `θ0 = 0`）
+
+```
+Xu = -(CDu + 2CD₁) q̄S/(m u0)        Zu = -(CLu + 2CL₁) q̄S/(m u0)
+Xw = -(CD_α - CL₁) q̄S/(m u0)        Zw = -(CL_α + CD₁) q̄S/(m u0)
+Xδ = -CD_δ q̄S/m                     Zq = -CL_q q̄S·MAC/(2 m u0)
+                                     Zẇ = -CL_α̇ q̄S·MAC/(2 m u0²)
+                                     Zδ = -CL_δ q̄S/m
+Mu = Cm_u q̄S·MAC/(u0 Iyy)           Mq = Cm_q q̄S·MAC²/(2 u0 Iyy)
+Mw = Cm_α q̄S·MAC/(u0 Iyy)           Mẇ = Cm_α̇ q̄S·MAC²/(2 u0² Iyy)
+Mδ = Cm_δ q̄S·MAC/Iyy
+```
+
+### 2.7 小擾乱線形化
+
+`ẋ = A x + B δ + B_T ΔThrottle`,  `x = [Δu, Δw, q, Δθ]ᵀ`
+
+```
+    ⎡ Xu              Xw              0                 -g ⎤
+A = ⎢ Zu'             Zw'             u0+Zq'             0 ⎥
+    ⎢ Mu+Mẇ Zu'       Mw+Mẇ Zw'       Mq+Mẇ(u0+Zq')      0 ⎥
+    ⎣ 0               0               1                  0 ⎦
+```
+
+`'` は `1/(1 - Zẇ)` 倍。推力は機体 x 軸方向なので安定軸では `α_trim` だけ傾き、
+`X_δT = T_max cos α_0 / m`, `Z_δT = -T_max sin α_0 / m`。
+
+固有値は **Faddeev–LeVerrier 法で特性方程式を作り、Durand–Kerner 法で 4 次方程式を解く**
+（外部ライブラリ不要）。`|λ|` の大きい対を短周期モード、小さい対をフゴイドモードとして分類し、
+教科書の近似式
+
+```
+ω_n,sp ≈ √(Zw Mq - u0 Mw)        ζ_sp ≈ -(Mq + Zw + u0 Mẇ)/(2 ω_n,sp)
+ω_n,ph ≈ √2 g / u0                ζ_ph ≈ CD₁/(√2 CL₁)
+```
+
+と並べて表示します（テストで一致を確認）。
+
+`TAB` を押すと同じ操縦入力を **非線形モデル / 線形モデル** に切り替えて飛ばせます。
+微小舵角ステップでは両者が一致することをテストで確認しています。
+
+---
+
+## 3. ビルド
 
 ```bash
-git clone <repo-url>
-cd flightSim
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-./build/FlightSim
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/flightsim          # ゲーム
+ctest --test-dir build     # 検証テスト
 ```
 
-デバッグビルド：
+raylib はシステムに入っていれば使い、無ければ CMake の `FetchContent` が自動で取得します
+（初回のみネットワークが必要）。GUI 不要なら `-DFS_BUILD_GUI=OFF` で物理コアとテストだけ
+ビルドできます（外部依存ゼロ）。
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j$(nproc)
+macOS は Xcode Command Line Tools のみで通ります。
+Linux は `libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev` が必要です。
+
+> 画面表記は英語です（raylib の既定フォントが ASCII のみのため）。式と解説は本 README と
+> ソースの日本語コメントを参照してください。
+
+---
+
+## 4. ファイル構成
+
+```
+src/atmosphere/     ISA 標準大気
+src/aircraft/       平面形 → MAC / 空力中心 / 質量中心 / Iyy / 空力微係数、難易度プリセット
+src/aerodynamics/   CL, CD, Cm（失速ブレンド込み）
+src/dynamics/       非線形 3DOF 縦運動方程式 + RK4
+src/stability/      トリム / 次元付き安定微係数 / A,B 行列 / 固有値 / 線形モデル飛行
+src/game/           ゲーム進行（設計フェーズ・飛行フェーズ・判定・履歴）
+src/gui/            raylib による画面（GUI 以外は raylib に非依存）
+tests/              検証テスト（依存ライブラリ無し、80 項目）
 ```
 
-## ブランチ戦略
+## 5. 検証テストの内容（`ctest`）
 
-| ブランチ | 役割 |
-| --- | --- |
-| `main` | 安定版。動作確認済みのリリース |
-| `develop` | 開発統合ブランチ |
-| `feature/*` | 機能単位の開発ブランチ |
-
-```
-feature/xxx  →  develop  →  main
-```
-
-## 実装フェーズ
-
-詳細は [REQUIREMENTS.md](REQUIREMENTS.md) を参照。
-
-- **Phase 1**：2D縦断面シミュレーター（平板モデル）
-- **Phase 2**：NACA翼型データ・動安定解析
-- **Phase 3**：3D拡張（6-DOF）
-- **Phase 4**：ゲーム化
-
-## 依存ライブラリ（CMake FetchContent で自動取得）
-
-| ライブラリ | 用途 |
-| --- | --- |
-| GLFW | ウィンドウ・入力管理 |
-| Dear ImGui | GUI |
-| ImPlot | グラフ描画 |
-| Eigen | 線形代数・固有値解析 |
-| Google Test | 単体テスト |
+1. **ISA** — 海面密度/温度/音速、11 km の気温・気圧
+2. **平面形** — MAC・`y_MAC`・`x_ac` の閉形式と数値積分の一致、面密度一定台形翼の
+   質量中心 = MAC 50%、バラスト無しで `Kn = -0.25`、後退角/AR/バラストの効果の向き
+3. **静安定** — `Cm_α = -Kn CL_α` が有限差分と一致、後退翼＋ねじり下げで `Cm_ac` が増える、
+   後退角 0 ではその効果が消える
+4. **トリム** — 複数速度で残差 ≈ 0、低速ほど大 `α`・後縁上げ、
+   トリム状態から 30 秒積分して高度・速度が保たれる
+5. **固有値ソルバ** — 既知固有値、`Σλ = trace`、`Πλ = det`、複素根
+6. **モード** — 短周期・フゴイドが教科書近似式と一致、`Kn < 0` で発散根が出る
+7. **線形 vs 非線形** — 0.5° 舵角ステップで 3 秒後の `Δθ`, `Δh`, `q` が一致
+8. **ゲーム** — PD オートパイロットで LEVEL 1–4 をクリアできる（線形モデルでも）

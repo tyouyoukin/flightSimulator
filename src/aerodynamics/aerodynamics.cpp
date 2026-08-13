@@ -1,71 +1,74 @@
-#include "aerodynamics.hpp"
-#include <cmath>
+#include "aerodynamics.h"
+
 #include <algorithm>
+#include <cmath>
 
-static constexpr double DEG2RAD = M_PI / 180.0;
+namespace fs {
 
-// 失速モデル：線形域 → 失速後は cos カーブで CL が減少し 90° でゼロへ
-// 抗力は失速後に平板的に増加する
-static void stall_model(double CL_alpha, double alpha, double alpha_stall_rad,
-                        double& CL_out, double& CD_stall_out) {
-    const double abs_a = std::fabs(alpha);
-    const double sign  = (alpha >= 0.0) ? 1.0 : -1.0;
-    const double CL_max = CL_alpha * alpha_stall_rad;
-
-    if (abs_a <= alpha_stall_rad) {
-        // 線形域
-        CL_out        = CL_alpha * alpha;
-        CD_stall_out  = 0.0;
-    } else {
-        // 失速後：CL_max から cos カーブで減衰（90° でゼロ）
-        const double t = (abs_a - alpha_stall_rad) / (M_PI / 2.0 - alpha_stall_rad);
-        const double t_clamp = std::clamp(t, 0.0, 1.0);
-        CL_out       = sign * CL_max * std::cos(t_clamp * M_PI / 2.0);
-        // 失速後の圧力抗力増加（平板モデル：CD ∝ sin²α）
-        CD_stall_out = 1.5 * std::sin(alpha) * std::sin(alpha) * t_clamp;
-    }
+double stallBlend(const Aircraft& ac, double alpha) {
+    const double M  = ac.stallSharp;
+    const double a0 = ac.alphaStall;
+    // Anderson の指数ブレンド関数
+    const double e1 = std::exp(std::clamp(-M * (alpha - a0), -60.0, 60.0));
+    const double e2 = std::exp(std::clamp( M * (alpha + a0), -60.0, 60.0));
+    const double num = 1.0 + e1 + e2;
+    const double den = (1.0 + e1) * (1.0 + e2);
+    return num / den;
 }
 
-AeroForces compute_aero(const AircraftParams& ac, const AeroState& state) {
-    const double V     = std::max(state.V, 1.0);
-    const double q_dyn = 0.5 * state.rho * V * V;
-    const double S_w   = ac.S_w();
-    const double S_t   = ac.S_t();
-    const double as_rad = ac.alpha_stall * DEG2RAD;
-
-    // Wing angle of attack (true AoA + wing incidence)
-    const double alpha_w = state.alpha + ac.i_w * DEG2RAD;
-
-    // Downwash at tail (Prandtl lifting line approximation)
-    const double d_eps_d_alpha = 2.0 * ac.CL_alpha_w() / (M_PI * ac.AR_w());
-    const double epsilon = d_eps_d_alpha * state.alpha;
-
-    // Tail AoA: geometric + incidence − downwash + pitch-rate contribution
-    const double alpha_pitch = state.q * (ac.x_ac_t() - ac.x_cg) / V;
-    const double alpha_t_base = state.alpha + ac.i_t * DEG2RAD - epsilon + alpha_pitch;
-    const double alpha_t_eff  = alpha_t_base - ac.tau_e * state.delta_e;
-
-    // Wing lift with stall model
-    double CL_w, CD_stall_w;
-    stall_model(ac.CL_alpha_w(), alpha_w, as_rad, CL_w, CD_stall_w);
-    const double L_w = q_dyn * S_w * CL_w;
-
-    // Tail lift（尾翼は通常 stall しないと仮定）
-    const double CL_t = ac.CL_alpha_t() * alpha_t_eff;
-    const double L_t  = ac.eta_t * q_dyn * S_t * CL_t;
-
-    // Total CL referenced to wing area
-    const double CL_total = CL_w + ac.eta_t * (S_t / S_w) * CL_t;
-
-    // Drag: parasite + induced + stall extra
-    const double CD_total = ac.CD0
-                          + (CL_total * CL_total) / (M_PI * ac.AR_w() * ac.e)
-                          + CD_stall_w;
-    const double D_total  = q_dyn * S_w * CD_total;
-
-    // Pitching moment about CG
-    const double M_w = L_w * (ac.x_cg - ac.x_ac_w());
-    const double M_t = L_t * (ac.x_cg - ac.x_ac_t());
-
-    return {L_w + L_t, D_total, M_w + M_t, CL_total, CD_total, alpha_t_eff};
+static double CLflatPlate(double alpha) {
+    // 平板の揚力 : 2 sin^2(a) cos(a) * sign(a)
+    const double s = std::sin(alpha);
+    return 2.0 * s * std::fabs(s) * std::cos(alpha);
 }
+
+AeroCoeffs computeAero(const Aircraft& ac, const AeroInput& in) {
+    AeroCoeffs out{};
+
+    const double V = std::max(in.V, 1.0);           // 低速での 0 割り防止
+    const double qhat     = in.q * ac.cbar / (2.0 * V);
+    const double alphahat = in.alphadot * ac.cbar / (2.0 * V);
+
+    // ---- 揚力 --------------------------------------------------------------
+    const double CLlin = ac.CL0 + ac.CLalpha * in.alpha + ac.CLq * qhat +
+                         ac.CLadot * alphahat + ac.CLdelta * in.delta;
+    const double sigma = stallBlend(ac, in.alpha);
+    const double CL    = (1.0 - sigma) * CLlin + sigma * CLflatPlate(in.alpha);
+
+    out.CL_linear = CLlin;
+    out.CL        = CL;
+    out.stalled   = (sigma > 0.35);
+
+    // ---- 抗力 --------------------------------------------------------------
+    const double k = ac.k_induced();
+    out.CD = ac.CD0 + k * CL * CL + ac.kdelta * in.delta * in.delta
+             + sigma * 1.20 * std::sin(in.alpha) * std::sin(in.alpha);  // 失速時の圧力抗力
+
+    // ---- ピッチングモーメント (重心まわり) -------------------------------------
+    // 無尾翼機なので中立点は翼の空力中心。h - h_n が負 (重心が前) のとき復元。
+    out.Cm = ac.Cm_ac + ac.Cmdelta_ac * in.delta
+             + (ac.h - ac.h_n) * CL
+             + ac.Cmq * qhat + ac.Cmadot * alphahat;
+
+    return out;
+}
+
+double CmSteady(const Aircraft& ac, double alpha, double delta) {
+    AeroInput in;
+    in.alpha = alpha;
+    in.delta = delta;
+    in.q = 0.0;
+    in.alphadot = 0.0;
+    return computeAero(ac, in).Cm;
+}
+
+double CLSteady(const Aircraft& ac, double alpha, double delta) {
+    AeroInput in;
+    in.alpha = alpha;
+    in.delta = delta;
+    in.q = 0.0;
+    in.alphadot = 0.0;
+    return computeAero(ac, in).CL;
+}
+
+}  // namespace fs
